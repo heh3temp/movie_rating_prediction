@@ -1,0 +1,320 @@
+---
+title: "Modeling and prediction for movies"
+output: 
+  html_document: 
+    fig_height: 4
+    highlight: pygments
+    theme: spacelab
+---
+
+## Setup
+
+### Load packages
+
+```{r load-packages, message = FALSE, include = FALSE}
+Sys.setenv("LANGUAGE"="EN")
+library(ggplot2)
+library(dplyr)
+library(statsr)
+library(tidyr)
+library(GGally)
+library(gridExtra)
+library(tibble)
+library(ggExtra)
+library(ggthemes)
+
+conflicts()
+
+```
+
+### Load data
+
+```{r load-data}
+load("movies.Rdata")
+```
+
+
+
+* * *
+
+## Part 1: Data
+#### Generalizibility
+Data from both IMDB and Rotten Tomatoes was collected using random sampling. Random sample of movies that were present on both portals was selected and then their parameters were added to the dataset. As movies aren't able to refuse to be sampled we can conclude that there are no sources of bias.
+
+#### Causality
+Random assingnent was not used, therefore causality cannot be determined.
+
+* * *
+
+## Part 2: Research question
+**What parameters make the movie well received by the audience**
+There are many parameters that differ between movies. Some of them such as interesting plot are impossible to know before the release, but others such as genre or renown of the director are known way before the movie premiere. In this study we will find out which of them are best suited to predict how well the movie will be recieved by the audience.
+
+* * *
+
+## Part 3: Exploratory data analysis
+
+For the purpose of this study we will select `imdb_rating` as our explanatory variable instead of `critics_score` or `audience_score`, beacause IMDB is much more audience driven and as such reflects opinions of common movie goers better than Rotten Tomatoes. The second assumption is that all explanatory variables must be able to be obtained before the release of the movie. For example number of votes or IMDB or whether movie was nominated for oscar won't be taken into account whereas runtime or whether director ever won an oscar will.
+
+Firstly we will compute correlation matrix between numerical variables, to help determine what variables appear to be correlated.
+
+```{r fig.width = 18, fig.height = 8, message = FALSE, warning = FALSE}
+
+movies %>%
+    select_if(is.numeric) %>%
+    select(-c(audience_score, critics_score, imdb_num_votes)) %>%
+    ggpairs()
+
+```
+
+As we can all numerical variables save for `runtime` show almost no correlation with `imdb_rating`.
+
+Next we will visualise some dependencies between movie's IMDB score, its runtime and several categorical variables, to help us determine whether they show some correlation or not.
+
+```{r fig.width = 10, fig.height = 8}
+p1 <- movies %>%
+    select(imdb_rating, runtime) %>%
+    drop_na() %>%
+    ggplot(aes(x = runtime, y = imdb_rating)) +
+        geom_jitter() +
+        geom_smooth(formula = y ~ x, method = "lm")
+
+p2 <- movies %>%
+    select(imdb_rating, best_dir_win) %>%
+    drop_na() %>%
+    ggplot(aes(x = imdb_rating, y = best_dir_win)) +
+        geom_boxplot()
+
+p3 <- movies %>%
+    select(imdb_rating, genre) %>%
+    drop_na() %>%
+    ggplot(aes(x = imdb_rating, y = genre)) +
+        geom_boxplot()
+
+p4 <- movies %>%
+    select(imdb_rating, mpaa_rating) %>%
+    drop_na() %>%
+    ggplot(aes(x = imdb_rating, y = mpaa_rating)) +
+        geom_boxplot()
+
+p5 <- movies %>%
+    select(imdb_rating, best_actor_win) %>%
+    drop_na() %>%
+    ggplot(aes(x = imdb_rating, y = best_actor_win)) +
+        geom_boxplot()
+
+p6 <- movies %>%
+    select(imdb_rating, best_actress_win) %>%
+    drop_na() %>%
+    ggplot(aes(x = imdb_rating, y = best_actress_win)) +
+        geom_boxplot()
+
+
+grid.arrange(p1, p2, p3, p4, p5, p6)
+```
+
+As we can see renown of the actors appears to have no effect on movie score. On the other hand renown of dierctor shows some, albeit minimal correlation. Genre seems to affect score heavily, as some genres such as documentary show considerably higher score range than for aexample horror or comedy. MPAA rating also seems to have an effect, although much smaller. Although movie runtime shows some association, some of this can be attributed to several leverage points.
+
+* * *
+
+## Part 4: Modeling
+
+Now we can proceed to creating a linear model, but first we need to drop unwanted variables and get rid of `NA` values as they would tamper with our model.
+
+```{r message=FALSE}
+clean_movies <- movies %>%
+    select(-c(title, imdb_url, rt_url, audience_rating, critics_rating, thtr_rel_year,
+              audience_score, critics_score, dvd_rel_year, dvd_rel_month, dvd_rel_day, best_pic_nom,
+              best_pic_win, top200_box)) %>%
+    drop_na()
+
+```
+
+Now we can train our linear model. There are many ways to select best model. In this study we will test two methods. One using **p-values** of coefficients and one using $AIC$ score.
+
+Because `R` standard library lacks function that selects model using only **p-values** we will write our own and then test it against built-in `step` function that uses $AIC$ score.
+
+```{r}
+step_pval <- function(model, treshhold = 0.05, verbose = F) {
+    
+    make_var_dict <- function(coeffs, variables) {
+        
+        dict <- new.env(hash = TRUE, parent = emptyenv(), size = 100L)
+        
+        for (variable in variables) {
+            dict[[variable]] <- coeffs[grepl(variable, coeffs)]
+            
+            for (coeff in dict[[variable]]) {
+                dict[[coeff]] <- variable
+            }
+        }
+        
+        return(dict)
+    }
+    
+    del_least_significant <- function(model, var_dict, variables, treshhold) {
+        
+        coeffs_pvals <- sort(summary(model)$coefficients[-1, 4], decreasing = T)
+        
+        coeffs_pvals_dict <- list2env(as.list(coeffs_pvals))
+  
+        deleted <- F
+        num <- 1L
+        
+        while (!deleted && num <= length(coeffs_pvals) && coeffs_pvals[[num]] > treshhold) { 
+            
+            remove_term <- names(coeffs_pvals[num])
+            
+            variable_to_del <- var_dict[[remove_term]]
+
+            to_del <- T
+            
+            for (coeff in var_dict[[variable_to_del]]) {
+                
+                if (coeffs_pvals_dict[[coeff]] < treshhold) {
+                    to_del <- F
+                    break
+                }
+            }
+            
+            if (to_del) {
+                index <- match(variable_to_del, variables)
+                new_terms <- drop.terms(terms(formula(model)), dropx = index)
+                new_form <- formula(new_terms)
+                model <- update(model, new_form)
+                variables <- variables[variables != variable_to_del]
+                deleted <- T
+            }
+
+            num <- num + 1L
+    
+        }
+        return(list(model, deleted, variables))
+    }
+    
+    variables <- all.vars(formula(model))[-1]
+    coeffs <- variable.names(model)[-1]
+    
+    var_dict <- make_var_dict(coeffs, variables)
+        
+    args <- list(model, T, variables)
+    names(args) <- c("model", "continue", "variables")
+    
+    while(args[["continue"]]) {
+
+        if (verbose)
+            print(summary(args[["model"]]))
+
+        args <- del_least_significant(args[["model"]], var_dict, args[["variables"]], treshhold)
+        names(args) <- c("model", "continue", "variables")
+
+    }
+    
+    return(args[["model"]])
+}
+
+```
+
+We create full model and then run backward model selection algorithm using `step`function. The algorithm will start dropping variables that increase the $AIC$ score the most and stop when $AIC$ score is minimised.
+
+```{r}
+  
+model_full <- lm(data = clean_movies, formula = imdb_rating ~ genre + best_actor_win + best_actress_win + best_dir_win + thtr_rel_month
+                 + mpaa_rating + runtime + thtr_rel_day + title_type)
+
+model_step_aic <- step(model_full, direction = "backward")
+```
+
+With our model trained we can use `summary` function to check it's parameters.
+
+```{r}
+summary(model_step_aic)
+```
+As we can see variables left are `genre`, `best_dir_win`, `mpaa_rating`, `runtime` and `title_type`. Most of them also showed some correlation with IMDB score on our plots.
+
+Now we will train a second model using our own `step_pval` function, that uses backward selection on full model and drops most insignificant variable in each iteration.
+
+```{r}
+model_step_pval <- step_pval(model_full)
+
+```
+
+Lastly we compare it to the previous model using `summary`.
+
+```{r}
+summary(model_step_pval)
+```
+
+As we can see both methods resulted in the same model, but it doesn't always need to be the case. Sometimes the models can differ because **p-values** and $AIC$ score measure different properties of the model.
+
+Lastly we need to check whether all conditions for validity of our linear model are met. We can assume that variables are independent of  each other and there is linear correlation between explanatory and repsonse variables, but we also need to check whether residuals are normally distributed around 0 and show no patterns.
+
+```{r fig.width = 12, fig.height = 3}
+
+resid_plot <- ggplot(data = model_step_pval, aes(x = .fitted, y = .resid)) +
+    geom_jitter() +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    xlab("Fitted values") +
+    ylab("Residuals") +
+    ggtitle("Residual plot")
+
+resid_hist <- ggplot(data = model_step_pval, aes(x = .resid)) +
+    geom_histogram(aes(y = ..count..), binwidth = 0.1) +
+    # geom_density(aes(y=0.1*..count..), colour="red", adjust=2) +
+    stat_function(fun = function(x)
+                  dnorm(x, mean = mean(resid(model_step_pval)), sd = sd(resid(model_step_pval)))
+                  * length(resid(model_step_pval)) * 0.1) +
+    xlab("Residuals") +
+    ggtitle("Residual distribution")
+
+resid_qq <- ggplot(data = model_step_pval, aes(sample = .resid)) +
+    stat_qq(distribution = stats::qnorm) +
+    stat_qq_line(distribution = stats::qnorm) +
+    ggtitle("Normal Q-Q plot")
+
+grid.arrange(resid_plot, resid_hist, resid_qq, nrow = 1)
+
+```
+
+```{r}
+
+ggMarginal(resid_plot + theme_hc(), margins = "y", type = "histogram", fill = "pink")
+
+ggMarginal(resid_qq + theme_bw(), type = "histogram", fill = "pink")
+```
+
+
+The obove plots show that residuals are indeed nearly normally distriubuted and show random scatter around 0. Thus we can conclude that our model is valid.
+
+* * *
+
+## Part 5: Prediction
+
+Now we can use our model to predict IMDB rating of a movie that was not included in the dataset. The movie of out choice will be Star Wars: The Rise of Skywalker released in december of 2019.
+
+```{r}
+rise_of_skywalker <- data.frame(mpaa_rating = "PG-13", genre = "Science Fiction & Fantasy",
+                                runtime = 141, title_type = "Feature Film", best_dir_win = "no")
+
+predict(model_step_pval, rise_of_skywalker)
+```
+
+The actual rating of this movie is $6.6$, so the predicted score of $5.9$ is pretty close. Despite adjusted $R^2$ of only $0.29$ our model was not far off. Of course it is only one film and in other examples the model may be much further off.
+
+* * *
+
+## Part 6: Conclusion
+
+After EDA and modeling we can conclude that variables most correlated with movie rating are genre, mpaa_rating, whether director ever won an oscar, runtime and title type.
+
+```{r}
+movies %>%
+  mutate(outlier = ifelse(runtime %in% boxplot.stats(movies$runtime)$out, "Yes", "No")) %>%
+  ggplot(aes(x = as.numeric(rownames(movies)), y = runtime, fill = outlier, color = outlier)) +
+  geom_point() +
+  geom_hline(aes(yintercept = mean(runtime, na.rm = T)))
+
+```
+
+* * *
+
